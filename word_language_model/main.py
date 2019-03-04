@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.onnx
+import numpy as np
 
 import data
 import model as rnn_model
@@ -126,36 +127,41 @@ def evaluate(data_source, model, criterion, corpus, eval_batch_size):
     ntokens = len(corpus.dictionary)
     hidden = init_hidden(model, eval_batch_size)
     with torch.no_grad():
-        for i in range(0, data_source.size(0) - 1, args.bptt):
+        for i in range(args.bptt * args.rank, data_source.size(0) - 1, args.bptt * args.world_size):
             data, targets = get_batch(data_source, i)
             output, hidden = model(data, hidden)
             output_flat = output.view(-1, ntokens)
             total_loss += len(data) * criterion(output_flat, targets).item()
             hidden = repackage_hidden(hidden)
-    return total_loss / (len(data_source) - 1)
+    return total_loss / ((len(data_source) - 1) / float(args.world_size))
 
 
-def train(model, criterion, train_data, corpus, epoch, lr):
+def train(model, optimizer, criterion, train_data, corpus, epoch, lr):
+    bptt = args.bptt if np.random.random() < 0.95 else args.bptt / 2.
+    # Prevent excessively small or negative sequence lengths
+    seq_len = max(5, int(np.random.normal(bptt, 5)))
+    lr2 = optimizer.param_groups[0]['lr']
+    optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
+
     # Turn on training mode which enables dropout.
     model.train()
     total_loss = 0.
     start_time = time.time()
     ntokens = len(corpus.dictionary)
     hidden = init_hidden(model, args.batch_size)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
+    for batch, i in enumerate(range(args.bptt * args.rank, train_data.size(0) - 1, args.bptt * args.world_size)):
         data, targets = get_batch(train_data, i)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = repackage_hidden(hidden)
-        model.zero_grad()
+        optimizer.zero_grad()
         output, hidden = model(data, hidden)
         loss = criterion(output.view(-1, ntokens), targets)
         loss.backward()
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad.data)
+        optimizer.step()
 
         total_loss += loss.item()
 
@@ -164,10 +170,12 @@ def train(model, criterion, train_data, corpus, epoch, lr):
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
+                epoch, batch, len(train_data) // (args.bptt * args.world_size), lr,
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
+
+    optimizer.param_groups[0]['lr'] = lr2
 
 
 def main():
@@ -204,10 +212,14 @@ def main():
     # Loop over epochs.
     lr = args.lr
     best_val_loss = None
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+
+    if 't0' in optimizer.param_groups[0]:
+        print ("Fix: TO here")
 
     for epoch in range(1, args.epochs+1):
         epoch_start_time = time.time()
-        train(model, criterion, train_data, corpus, epoch, lr)
+        train(model, optimizer, criterion, train_data, corpus, epoch, lr)
         val_loss = evaluate(val_data, model, criterion, corpus, eval_batch_size)
         print('-' * 89)
         print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
@@ -222,6 +234,7 @@ def main():
         else:
             # Anneal the learning rate if no improvement has been seen in the validation dataset.
             lr /= 4.0
+            optimizer.param_groups[0]['lr'] = lr
 
 
 if __name__ == "__main__":
