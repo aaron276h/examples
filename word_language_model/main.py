@@ -40,14 +40,10 @@ parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
-parser.add_argument('--cuda', action='store_true',
-                    help='use CUDA')
 parser.add_argument('--log-interval', type=int, default=200, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str, default='model.pt',
                     help='path to save the final model')
-parser.add_argument('--onnx-export', type=str, default='',
-                    help='path to export the final model in onnx format')
 parser.add_argument('--rank', type=int, default=0,
                     help='rank of worker')
 parser.add_argument('--world_size', type=int, default=1,
@@ -208,7 +204,6 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model)
         print ("Setup distributed training")
 
-
     # Loop over epochs.
     lr = args.lr
     best_val_loss = None
@@ -236,35 +231,13 @@ def main():
             lr /= 4.0
             optimizer.param_groups[0]['lr'] = lr
 
+    # Run on test data.
+    test_loss = evaluate(test_data, model, criterion, corpus, eval_batch_size)
+    print('=' * 89)
+    print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+        test_loss, math.exp(test_loss)))
+    print('=' * 89)
+
 
 if __name__ == "__main__":
     main()
-
-'''
-def export_onnx(path, batch_size, seq_len):
-    print('The model is also exported in ONNX format at {}'.
-          format(os.path.realpath(args.onnx_export)))
-    model.eval()
-    dummy_input = torch.LongTensor(seq_len * batch_size).zero_().view(-1, batch_size).to(device)
-    hidden = model.init_hidden(batch_size)
-    torch.onnx.export(model, (dummy_input, hidden), path)
-
-
-# Load the best saved model.
-with open(args.save, 'rb') as f:
-    model = torch.load(f)
-    # after load the rnn params are not a continuous chunk of memory
-    # this makes them a continuous chunk, and will speed up forward pass
-    model.rnn.flatten_parameters()
-
-# Run on test data.
-test_loss = evaluate(test_data)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
-    test_loss, math.exp(test_loss)))
-print('=' * 89)
-
-if len(args.onnx_export) > 0:
-    # Export the model in ONNX format.
-    export_onnx(args.onnx_export, batch_size=1, seq_len=args.bptt)
-'''
