@@ -8,7 +8,9 @@ import torch.nn as nn
 import torch.onnx
 
 import data
-import model
+import model as rnn_model
+
+import torch.distributed as dist
 
 parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default='./data/wikitext-2',
@@ -45,21 +47,17 @@ parser.add_argument('--save', type=str, default='model.pt',
                     help='path to save the final model')
 parser.add_argument('--onnx-export', type=str, default='',
                     help='path to export the final model in onnx format')
+parser.add_argument('--rank', type=int, default=0,
+                    help='rank of worker')
+parser.add_argument('--world_size', type=int, default=1,
+                    help='number of workers')
 args = parser.parse_args()
-
-# Set the random seed manually for reproducibility.
-torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    if not args.cuda:
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
-
-device = torch.device("cuda" if args.cuda else "cpu")
 
 ###############################################################################
 # Load data
 ###############################################################################
 
-corpus = data.Corpus(args.data)
+
 
 # Starting from sequential data, batchify arranges the dataset into columns.
 # For instance, with the alphabet as the sequence and batch size 4, we'd get
@@ -80,21 +78,8 @@ def batchify(data, bsz):
     data = data.narrow(0, 0, nbatch * bsz)
     # Evenly divide the data across the bsz batches.
     data = data.view(bsz, -1).t().contiguous()
-    return data.to(device)
+    return data.cuda()
 
-eval_batch_size = 10
-train_data = batchify(corpus.train, args.batch_size)
-val_data = batchify(corpus.valid, eval_batch_size)
-test_data = batchify(corpus.test, eval_batch_size)
-
-###############################################################################
-# Build the model
-###############################################################################
-
-ntokens = len(corpus.dictionary)
-model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied).to(device)
-
-criterion = nn.CrossEntropyLoss()
 
 ###############################################################################
 # Training code
@@ -106,6 +91,15 @@ def repackage_hidden(h):
         return h.detach()
     else:
         return tuple(repackage_hidden(v) for v in h)
+
+
+def init_hidden(model, bsz):
+    weight = next(model.parameters())
+    if args.model == 'LSTM':
+        return (weight.new_zeros(args.nlayers, bsz, args.nhid),
+                weight.new_zeros(args.nlayers, bsz, args.nhid))
+    else:
+        return weight.new_zeros(args.nlayers, bsz, args.nhid)
 
 
 # get_batch subdivides the source data into chunks of length args.bptt.
@@ -125,12 +119,12 @@ def get_batch(source, i):
     return data, target
 
 
-def evaluate(data_source):
+def evaluate(data_source, model, criterion, corpus, eval_batch_size):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     total_loss = 0.
     ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(eval_batch_size)
+    hidden = init_hidden(model, eval_batch_size)
     with torch.no_grad():
         for i in range(0, data_source.size(0) - 1, args.bptt):
             data, targets = get_batch(data_source, i)
@@ -141,13 +135,13 @@ def evaluate(data_source):
     return total_loss / (len(data_source) - 1)
 
 
-def train():
+def train(model, criterion, train_data, corpus, epoch, lr):
     # Turn on training mode which enables dropout.
     model.train()
     total_loss = 0.
     start_time = time.time()
     ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(args.batch_size)
+    hidden = init_hidden(model, args.batch_size)
     for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
         data, targets = get_batch(train_data, i)
         # Starting each batch, we detach the hidden state from how it was previously produced.
@@ -176,25 +170,45 @@ def train():
             start_time = time.time()
 
 
-def export_onnx(path, batch_size, seq_len):
-    print('The model is also exported in ONNX format at {}'.
-          format(os.path.realpath(args.onnx_export)))
-    model.eval()
-    dummy_input = torch.LongTensor(seq_len * batch_size).zero_().view(-1, batch_size).to(device)
-    hidden = model.init_hidden(batch_size)
-    torch.onnx.export(model, (dummy_input, hidden), path)
+def main():
+    # Set the random seed manually for reproducibility.
+    torch.manual_seed(args.seed)
+    torch.cuda.set_device(0)
+
+    corpus = data.Corpus(args.data)
+    eval_batch_size = 10
+    train_data = batchify(corpus.train, args.batch_size)
+    val_data = batchify(corpus.valid, eval_batch_size)
+    test_data = batchify(corpus.test, eval_batch_size)
+
+    ntokens = len(corpus.dictionary)
+    model = rnn_model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied).cuda()
+
+    criterion = nn.CrossEntropyLoss()
+
+    args.distributed = args.world_size > 1
+    if args.distributed:
+        os.environ['MASTER_ADDR'] = "v01"
+        os.environ['MASTER_PORT'] = str(13245)
+
+        dist.init_process_group(
+            backend="gloo",
+            init_method='env://',
+            rank=args.rank,
+            world_size=args.world_size)
+
+        model = torch.nn.parallel.DistributedDataParallel(model)
+        print ("Setup distributed training")
 
 
-# Loop over epochs.
-lr = args.lr
-best_val_loss = None
+    # Loop over epochs.
+    lr = args.lr
+    best_val_loss = None
 
-# At any point you can hit Ctrl + C to break out of training early.
-try:
     for epoch in range(1, args.epochs+1):
         epoch_start_time = time.time()
-        train()
-        val_loss = evaluate(val_data)
+        train(model, criterion, train_data, corpus, epoch, lr)
+        val_loss = evaluate(val_data, model, criterion, corpus, eval_batch_size)
         print('-' * 89)
         print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                 'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
@@ -208,9 +222,20 @@ try:
         else:
             # Anneal the learning rate if no improvement has been seen in the validation dataset.
             lr /= 4.0
-except KeyboardInterrupt:
-    print('-' * 89)
-    print('Exiting from training early')
+
+
+if __name__ == "__main__":
+    main()
+
+'''
+def export_onnx(path, batch_size, seq_len):
+    print('The model is also exported in ONNX format at {}'.
+          format(os.path.realpath(args.onnx_export)))
+    model.eval()
+    dummy_input = torch.LongTensor(seq_len * batch_size).zero_().view(-1, batch_size).to(device)
+    hidden = model.init_hidden(batch_size)
+    torch.onnx.export(model, (dummy_input, hidden), path)
+
 
 # Load the best saved model.
 with open(args.save, 'rb') as f:
@@ -229,3 +254,4 @@ print('=' * 89)
 if len(args.onnx_export) > 0:
     # Export the model in ONNX format.
     export_onnx(args.onnx_export, batch_size=1, seq_len=args.bptt)
+'''

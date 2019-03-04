@@ -4,3 +4,9 @@ data
 OpenNMT/data
 cpp/mnist/build
 cpp/dcgan/build
+
+
+upload.sh
+commit_msg
+*~
+.idea
